@@ -1,0 +1,233 @@
+{
+  "openapi": "3.0.0",
+  "paths": {
+    "/": {
+      "get": {
+        "operationId": "AppController_getHello",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "AppController_getHealth",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/notifications/device-token": {
+      "post": {
+        "operationId": "NotificationsController_registerDeviceToken",
+        "summary": "Register device token",
+        "description": "Register or update an FCM device token for a user of a given app. Re-registering the same token updates the record. Typically called at app initialization.",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterDeviceTokenDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Token registered successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisterDeviceTokenResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "appId, userId and token are required"
+          }
+        },
+        "tags": [
+          "notifications"
+        ]
+      }
+    },
+    "/notifications/send": {
+      "post": {
+        "operationId": "NotificationsController_sendNotification",
+        "summary": "Send push notification",
+        "description": "Send a push notification to all devices registered for the given user and app. Returns sent/failed counts and any invalid tokens (which are removed).",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendNotificationDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Send result with sent/failed counts and invalid tokens",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendNotificationResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "appId and userId are required / no device tokens found / Firebase is not configured"
+          }
+        },
+        "tags": [
+          "notifications"
+        ]
+      }
+    }
+  },
+  "info": {
+    "title": "Notification API",
+    "description": "Push notification service - register FCM device tokens and send push notifications to end users of a given app (scoped by appId)",
+    "version": "1.0",
+    "contact": {}
+  },
+  "tags": [
+    {
+      "name": "notifications",
+      "description": "Device token registration and push delivery"
+    }
+  ],
+  "servers": [
+    {
+      "url": "http://localhost:3001",
+      "description": "Local development server"
+    }
+  ],
+  "components": {
+    "schemas": {
+      "RegisterDeviceTokenDto": {
+        "type": "object",
+        "properties": {
+          "appId": {
+            "type": "string",
+            "description": "Application ID the device belongs to",
+            "example": "app-12345"
+          },
+          "userId": {
+            "type": "string",
+            "description": "User ID owning the device (e.g. MongoDB _id from the User API)",
+            "example": "507f1f77bcf86cd799439011"
+          },
+          "token": {
+            "type": "string",
+            "description": "FCM device token obtained on the client",
+            "example": "fcm-device-token-abc123"
+          },
+          "platform": {
+            "type": "string",
+            "description": "Platform of the device",
+            "enum": [
+              "ios",
+              "android",
+              "web"
+            ],
+            "example": "android"
+          }
+        },
+        "required": [
+          "appId",
+          "userId",
+          "token"
+        ]
+      },
+      "RegisterDeviceTokenResponseDto": {
+        "type": "object",
+        "properties": {
+          "registered": {
+            "type": "boolean",
+            "example": true
+          }
+        },
+        "required": [
+          "registered"
+        ]
+      },
+      "SendNotificationDto": {
+        "type": "object",
+        "properties": {
+          "appId": {
+            "type": "string",
+            "description": "Application ID to scope the delivery",
+            "example": "app-12345"
+          },
+          "userId": {
+            "type": "string",
+            "description": "User ID to send the notification to",
+            "example": "507f1f77bcf86cd799439011"
+          },
+          "title": {
+            "type": "string",
+            "description": "Notification title",
+            "example": "New order received"
+          },
+          "body": {
+            "type": "string",
+            "description": "Notification body",
+            "example": "Order #123 is ready for pickup"
+          },
+          "data": {
+            "type": "object",
+            "description": "Optional key-value data payload (values are sent as strings)",
+            "example": {
+              "screen": "orders",
+              "id": "123"
+            }
+          }
+        },
+        "required": [
+          "appId",
+          "userId"
+        ]
+      },
+      "SendNotificationResponseDto": {
+        "type": "object",
+        "properties": {
+          "sent": {
+            "type": "number",
+            "description": "Number of messages sent successfully",
+            "example": 2
+          },
+          "failed": {
+            "type": "number",
+            "description": "Number of send failures",
+            "example": 0
+          },
+          "invalidTokens": {
+            "description": "Tokens that were invalid or unregistered (and removed)",
+            "example": [],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "sent",
+          "failed",
+          "invalidTokens"
+        ]
+      }
+    }
+  }
+}

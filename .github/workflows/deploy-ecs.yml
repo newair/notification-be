@@ -1,0 +1,366 @@
+name: Deploy notification-be to Lightsail
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  LIGHTSAIL_STACK_DIR: ${{ secrets.LIGHTSAIL_STACK_DIR }}
+  LIGHTSAIL_ENV_FILE: ${{ secrets.LIGHTSAIL_ENV_FILE }}
+  LIGHTSAIL_SERVICES_ENV_FILE: ${{ secrets.LIGHTSAIL_SERVICES_ENV_FILE }}
+  DEPLOY_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: >-
+      ${{ (github.event_name == 'workflow_run'
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.event == 'push'
+      )
+      || github.event_name == 'workflow_dispatch'
+      }}
+    concurrency:
+      group: deploy-notification-be-${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Validate required deploy settings
+        shell: bash
+        run: |
+          : "${AWS_REGION:?Set AWS_REGION secret}"
+          : "${ECR_REPOSITORY:?Set ECR_REPOSITORY secret}"
+          : "${LIGHTSAIL_HOST:?Set LIGHTSAIL_HOST secret}"
+          : "${LIGHTSAIL_SSH_USER:?Set LIGHTSAIL_SSH_USER secret}"
+          : "${LIGHTSAIL_SSH_KEY:?Set LIGHTSAIL_SSH_KEY secret}"
+        env:
+          LIGHTSAIL_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          LIGHTSAIL_SSH_USER: ${{ secrets.LIGHTSAIL_SSH_USER }}
+          LIGHTSAIL_SSH_KEY: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+
+      # Plain `docker build` uses the default docker driver; buildx is not required here.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve deployment metadata
+        id: meta
+        shell: bash
+        run: |
+          # Use the action-resolved registry (account auto-detected via STS) so the hostname
+          # always matches the credentials written by amazon-ecr-login.
+          ECR_REGISTRY="${{ steps.ecr.outputs.registry }}"
+          IMAGE_REPOSITORY="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          IMAGE_SHA_TAG="${IMAGE_REPOSITORY}:${DEPLOY_SHA}"
+          IMAGE_LATEST_TAG="${IMAGE_REPOSITORY}:latest"
+          STACK_DIR="${LIGHTSAIL_STACK_DIR:-/opt/lightsail}"
+          ENV_FILE="${LIGHTSAIL_ENV_FILE:-/opt/notification-be/.env}"
+          SERVICES_ENV_FILE="${LIGHTSAIL_SERVICES_ENV_FILE:-${STACK_DIR}/services.env}"
+
+          echo "ecr_registry=${ECR_REGISTRY}" >> "${GITHUB_OUTPUT}"
+          echo "image_sha_tag=${IMAGE_SHA_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "image_latest_tag=${IMAGE_LATEST_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "stack_dir=${STACK_DIR}" >> "${GITHUB_OUTPUT}"
+          echo "env_file=${ENV_FILE}" >> "${GITHUB_OUTPUT}"
+          echo "services_env_file=${SERVICES_ENV_FILE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build Docker image
+        run: docker build -t "${{ steps.meta.outputs.image_sha_tag }}" -t "${{ steps.meta.outputs.image_latest_tag }}" .
+
+      - name: Push Docker image tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "${AWS_REGION}" | \
+            docker login --username AWS --password-stdin "${{ steps.meta.outputs.ecr_registry }}"
+          docker push "${{ steps.meta.outputs.image_sha_tag }}"
+          docker push "${{ steps.meta.outputs.image_latest_tag }}"
+
+      - name: Configure SSH key
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.LIGHTSAIL_SSH_KEY }}" > ~/.ssh/lightsail_key
+          chmod 600 ~/.ssh/lightsail_key
+
+      # Prefer a static IP for SSH (LIGHTSAIL_SSH_HOST) so SSH doesn't hang on
+      # IPv6/DNS issues when LIGHTSAIL_HOST is a public domain.
+      - name: Resolve SSH target host
+        id: ssh
+        shell: bash
+        env:
+          LIGHTSAIL_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          LIGHTSAIL_SSH_HOST: ${{ secrets.LIGHTSAIL_SSH_HOST }}
+        run: |
+          if [[ -n "${LIGHTSAIL_SSH_HOST}" ]]; then
+            echo "host=${LIGHTSAIL_SSH_HOST}" >> "$GITHUB_OUTPUT"
+          else
+            echo "host=${LIGHTSAIL_HOST}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Add Lightsail host to known hosts
+        shell: bash
+        env:
+          SSH_HOST: ${{ steps.ssh.outputs.host }}
+        run: |
+          ssh-keyscan -4 -T 15 -H "${SSH_HOST}" >> ~/.ssh/known_hosts 2>/dev/null || \
+            echo "Warning: ssh-keyscan failed; proceeding with StrictHostKeyChecking=accept-new"
+
+      - name: Verify SSH to Lightsail
+        shell: bash
+        env:
+          SSH_HOST: ${{ steps.ssh.outputs.host }}
+          SSH_USER: ${{ secrets.LIGHTSAIL_SSH_USER }}
+        run: |
+          set -euo pipefail
+          SSH_OPTS=(
+            -4
+            -i ~/.ssh/lightsail_key
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=accept-new
+            -o ConnectTimeout=30
+            -o ConnectionAttempts=1
+          )
+          for attempt in 1 2 3 4 5; do
+            if ssh "${SSH_OPTS[@]}" "${SSH_USER}@${SSH_HOST}" 'echo ssh-ok'; then
+              echo "SSH OK (${SSH_USER}@${SSH_HOST}, attempt ${attempt})"
+              exit 0
+            fi
+            echo "SSH attempt ${attempt}/5 failed; retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Cannot SSH to ${SSH_HOST}:22 from GitHub Actions." >&2
+          echo "::error::Lightsail Networking → IPv4 Firewall: SSH (TCP 22) from Any IPv4." >&2
+          echo "::error::Prefer LIGHTSAIL_SSH_HOST = static public IP." >&2
+          exit 1
+
+      - name: Build and sync env file to Lightsail
+        env:
+          APP_NODE_ENV: ${{ secrets.NODE_ENV }}
+          # PORT intentionally not configurable: nginx hard-codes `notification-be:3000` (see infra/nginx).
+          APP_MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          APP_FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          APP_FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+          APP_PUBLIC_API_URL: ${{ secrets.PUBLIC_API_URL }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APP_MONGODB_URI:-}" ]]; then
+            echo "Full app env secrets not configured; preserving existing '${{ steps.meta.outputs.env_file }}' on host."
+            # Even when the full env rebuild is skipped, upsert any individual key the
+            # caller did provide as a secret — so setting just FIREBASE_SERVICE_ACCOUNT
+            # (or PUBLIC_API_URL, etc.) works without forcing the operator to re-supply
+            # every other secret.
+            ssh -4 -i ~/.ssh/lightsail_key \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=30 \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=40 \
+              -o TCPKeepAlive=yes \
+              "${{ secrets.LIGHTSAIL_SSH_USER }}@${{ steps.ssh.outputs.host }}" \
+              env REMOTE_ENV_PATH='${{ steps.meta.outputs.env_file }}' \
+                  NEW_NODE_ENV="${APP_NODE_ENV:-}" \
+                  NEW_PUBLIC_API_URL="${APP_PUBLIC_API_URL:-}" \
+                  NEW_FIREBASE_SERVICE_ACCOUNT="${APP_FIREBASE_SERVICE_ACCOUNT:-}" \
+                  NEW_FIREBASE_PROJECT_ID="${APP_FIREBASE_PROJECT_ID:-}" \
+                  bash -s <<'REMOTE'
+          set -euo pipefail
+          sudo install -d -m 755 "$(dirname "$REMOTE_ENV_PATH")"
+          sudo touch "$REMOTE_ENV_PATH"
+          sudo chmod 600 "$REMOTE_ENV_PATH"
+          upsert_key() {
+            local key="$1" val="$2"
+            [[ -z "$val" ]] && return 0
+            if sudo grep -q "^${key}=" "$REMOTE_ENV_PATH"; then
+              sudo sed -i "s|^${key}=.*|${key}=${val}|" "$REMOTE_ENV_PATH"
+            else
+              printf '%s=%s\n' "${key}" "${val}" | sudo tee -a "$REMOTE_ENV_PATH" >/dev/null
+            fi
+            echo "Upserted ${key} into $REMOTE_ENV_PATH"
+          }
+          upsert_key NODE_ENV                 "$NEW_NODE_ENV"
+          upsert_key PUBLIC_API_URL           "$NEW_PUBLIC_API_URL"
+          upsert_key FIREBASE_SERVICE_ACCOUNT "$NEW_FIREBASE_SERVICE_ACCOUNT"
+          upsert_key FIREBASE_PROJECT_ID      "$NEW_FIREBASE_PROJECT_ID"
+          REMOTE
+            exit 0
+          fi
+
+          {
+            printf 'NODE_ENV=%s\n' "${APP_NODE_ENV:-production}"
+            printf 'PORT=3000\n'
+            printf 'MONGODB_URI=%s\n' "${APP_MONGODB_URI}"
+            printf 'FIREBASE_SERVICE_ACCOUNT=%s\n' "${APP_FIREBASE_SERVICE_ACCOUNT:-}"
+            printf 'FIREBASE_PROJECT_ID=%s\n' "${APP_FIREBASE_PROJECT_ID:-}"
+            printf 'PUBLIC_API_URL=%s\n' "${APP_PUBLIC_API_URL:-}"
+          } > /tmp/lightsail-deploy.env
+
+          scp -4 -i ~/.ssh/lightsail_key \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=40 \
+            -o TCPKeepAlive=yes \
+            /tmp/lightsail-deploy.env \
+            "${{ secrets.LIGHTSAIL_SSH_USER }}@${{ steps.ssh.outputs.host }}:~/lightsail-deploy.env"
+          rm -f /tmp/lightsail-deploy.env
+
+          ssh -4 -i ~/.ssh/lightsail_key \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=40 \
+            -o TCPKeepAlive=yes \
+            "${{ secrets.LIGHTSAIL_SSH_USER }}@${{ steps.ssh.outputs.host }}" \
+            env REMOTE_ENV_PATH='${{ steps.meta.outputs.env_file }}' bash -s <<'REMOTE'
+          set -euo pipefail
+          sudo install -d -m 755 "$(dirname "$REMOTE_ENV_PATH")"
+          sudo install -o "$USER" -g "$USER" -m 600 "$HOME/lightsail-deploy.env" "$REMOTE_ENV_PATH"
+          rm -f "$HOME/lightsail-deploy.env"
+          REMOTE
+
+      - name: Remote docker login to ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "${{ env.AWS_REGION }}" | \
+            ssh -4 -T -i ~/.ssh/lightsail_key \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=30 \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=40 \
+              -o TCPKeepAlive=yes \
+              "${{ secrets.LIGHTSAIL_SSH_USER }}@${{ steps.ssh.outputs.host }}" \
+              "if docker info >/dev/null 2>&1; then docker login --username AWS --password-stdin ${{ steps.meta.outputs.ecr_registry }}; else sudo docker login --username AWS --password-stdin ${{ steps.meta.outputs.ecr_registry }}; fi"
+
+      - name: Deploy only notification-be service using docker compose
+        shell: bash
+        run: |
+          ssh -4 -i ~/.ssh/lightsail_key \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=40 \
+            -o TCPKeepAlive=yes \
+            "${{ secrets.LIGHTSAIL_SSH_USER }}@${{ steps.ssh.outputs.host }}" \
+            env \
+              STACK_DIR='${{ steps.meta.outputs.stack_dir }}' \
+              NOTIFICATION_BE_IMAGE='${{ steps.meta.outputs.image_latest_tag }}' \
+              SERVICES_ENV_FILE='${{ steps.meta.outputs.services_env_file }}' \
+              NOTIFICATION_ENV_FILE='${{ steps.meta.outputs.env_file }}' \
+              bash -s <<'REMOTE_SCRIPT'
+          set -euo pipefail
+          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+          COMPOSE_FILE="${STACK_DIR}/docker-compose.yml"
+
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::error::docker is not installed on Lightsail host." >&2
+            exit 1
+          fi
+          if docker info >/dev/null 2>&1; then
+            DOCKER=(docker)
+          elif sudo docker info >/dev/null 2>&1; then
+            echo "Using sudo docker (user not in docker group in this SSH session); add user to docker group or re-login for passwordless docker."
+            DOCKER=(sudo docker)
+          else
+            echo "::error::Cannot reach Docker daemon (docker info failed). Ensure Docker is running: sudo systemctl status docker" >&2
+            exit 1
+          fi
+
+          if [[ "${DOCKER[0]}" == "sudo" ]]; then
+            compose_short_ver=$(sudo docker-compose version --short 2>/dev/null || true)
+          else
+            compose_short_ver=$(docker-compose version --short 2>/dev/null || true)
+          fi
+          if "${DOCKER[@]}" compose version >/dev/null 2>&1; then
+            DC=("${DOCKER[@]}" compose)
+          elif [[ "${compose_short_ver}" =~ ^2\. ]]; then
+            if [[ "${DOCKER[0]}" == "sudo" ]]; then DC=(sudo docker-compose); else DC=(docker-compose); fi
+          else
+            echo "Compose v2 plugin not found; installing static CLI plugin (no apt — avoids OOM and missing docker-compose-plugin repo)..."
+            COMPOSE_VER="2.38.2"
+            ARCH="$(uname -m)"
+            case "${ARCH}" in
+              x86_64) COMPOSE_DL_ARCH="x86_64" ;;
+              aarch64|arm64) COMPOSE_DL_ARCH="aarch64" ;;
+              *)
+                echo "::error::Unsupported host architecture for Compose install: ${ARCH}" >&2
+                exit 1
+                ;;
+            esac
+            sudo mkdir -p /usr/local/lib/docker/cli-plugins
+            sudo curl -fsSL "https://github.com/docker/compose/releases/download/v${COMPOSE_VER}/docker-compose-linux-${COMPOSE_DL_ARCH}" \
+              -o /usr/local/lib/docker/cli-plugins/docker-compose
+            sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+            if "${DOCKER[@]}" compose version >/dev/null 2>&1; then
+              DC=("${DOCKER[@]}" compose)
+            else
+              echo "::error::docker compose still unavailable after installing plugin binary. Check curl/Docker CLI on host." >&2
+              exit 1
+            fi
+          fi
+          if [ ! -f "${COMPOSE_FILE}" ]; then
+            echo "::error::Compose file missing at ${COMPOSE_FILE}" >&2
+            exit 1
+          fi
+          if [ ! -f "${NOTIFICATION_ENV_FILE}" ]; then
+            echo "::warning::notification-be env file missing at ${NOTIFICATION_ENV_FILE}; creating empty file via pipeline."
+            sudo install -d -m 755 "$(dirname "${NOTIFICATION_ENV_FILE}")"
+            sudo touch "${NOTIFICATION_ENV_FILE}"
+          fi
+
+          sudo install -d -m 755 "$(dirname "${SERVICES_ENV_FILE}")"
+          sudo touch "${SERVICES_ENV_FILE}"
+          if sudo grep -q '^NOTIFICATION_BE_IMAGE=' "${SERVICES_ENV_FILE}"; then
+            sudo sed -i.bak "s|^NOTIFICATION_BE_IMAGE=.*|NOTIFICATION_BE_IMAGE=${NOTIFICATION_BE_IMAGE}|" "${SERVICES_ENV_FILE}"
+          else
+            printf 'NOTIFICATION_BE_IMAGE=%s\n' "${NOTIFICATION_BE_IMAGE}" | sudo tee -a "${SERVICES_ENV_FILE}" >/dev/null
+          fi
+
+          cd "${STACK_DIR}"
+          "${DC[@]}" --env-file "${SERVICES_ENV_FILE}" stop notification-be 2>/dev/null || true
+          "${DC[@]}" --env-file "${SERVICES_ENV_FILE}" rm -f notification-be 2>/dev/null || true
+          "${DOCKER[@]}" rm -f notification-be 2>/dev/null || true
+
+          "${DC[@]}" --env-file "${SERVICES_ENV_FILE}" pull notification-be
+          "${DC[@]}" --env-file "${SERVICES_ENV_FILE}" up -d --no-deps notification-be
+          "${DC[@]}" --env-file "${SERVICES_ENV_FILE}" ps notification-be
+          "${DC[@]}" --env-file "${SERVICES_ENV_FILE}" exec -T reverse-proxy nginx -s reload 2>/dev/null || true
+
+          # Self-heal: gateway must respond on :80 (HTTP) or :443 (HTTPS, when TLS enabled).
+          gateway_alive() {
+            curl -sfk --max-time 3 https://127.0.0.1/ 2>/dev/null | grep -Fq 'multi-service gateway' && return 0
+            curl -sf  --max-time 3 http://127.0.0.1/  2>/dev/null | grep -Fq 'multi-service gateway'
+          }
+          if ! gateway_alive; then
+            echo "::warning::Gateway not responding on 127.0.0.1; forcing reverse-proxy recreate..."
+            "${DC[@]}" --env-file "${SERVICES_ENV_FILE}" up -d --no-deps --force-recreate reverse-proxy || true
+            sleep 4
+            if ! gateway_alive; then
+              echo "::error::Gateway not reachable after proxy recreate — run infra workflow or resolve port conflict on host." >&2
+              "${DC[@]}" --env-file "${SERVICES_ENV_FILE}" ps reverse-proxy || true
+              sudo ss -ltnp | grep -E ':(80|443) ' || echo "(nothing listening on :80 or :443)"
+              exit 1
+            fi
+          fi
+          REMOTE_SCRIPT
