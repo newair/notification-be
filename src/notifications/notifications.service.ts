@@ -11,6 +11,11 @@ import {
   SendNotificationDto,
   SendNotificationResponseDto,
 } from './dto/send-notification.dto';
+import {
+  DeleteDeviceTokenDto,
+  DeleteDeviceTokenResponseDto,
+  DeleteUserDeviceTokensDto,
+} from './dto/delete-device-token.dto';
 
 // FCM error codes that mean the token is dead and should be removed.
 const INVALID_TOKEN_ERROR_CODES = new Set([
@@ -114,6 +119,39 @@ export class NotificationsService {
       failed: response.failureCount,
       invalidTokens,
     };
+  }
+
+  /** Remove a single FCM token regardless of which user it belongs to. */
+  async deleteDeviceToken(
+    dto: DeleteDeviceTokenDto,
+  ): Promise<DeleteDeviceTokenResponseDto> {
+    const result = await this.deviceTokenModel
+      .deleteOne({ token: dto.token })
+      .exec();
+    this.logger.log(`Deleted device token (matched=${result.deletedCount})`);
+    return { deleted: result.deletedCount };
+  }
+
+  /**
+   * Remove tokens for a given user + app. When `dto.token` is provided only
+   * that specific token is removed; otherwise every token for the user is
+   * removed (e.g. on account deletion or sign-out-all-devices).
+   */
+  async deleteUserDeviceTokens(
+    dto: DeleteUserDeviceTokensDto,
+  ): Promise<DeleteDeviceTokenResponseDto> {
+    const filter: Record<string, string> = {
+      appId: dto.appId,
+      userId: dto.userId,
+    };
+    if (dto.token) {
+      filter['token'] = dto.token;
+    }
+    const result = await this.deviceTokenModel.deleteMany(filter).exec();
+    this.logger.log(
+      `Deleted ${result.deletedCount} device token(s) for appId=${dto.appId} userId=${dto.userId}`,
+    );
+    return { deleted: result.deletedCount };
   }
 
   private toStringRecord(

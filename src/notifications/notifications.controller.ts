@@ -1,7 +1,8 @@
-import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
+import { Body, Controller, Delete, HttpCode, HttpStatus, Post } from '@nestjs/common';
 import {
   ApiBadRequestResponse,
   ApiCreatedResponse,
+  ApiNotFoundResponse,
   ApiOkResponse,
   ApiOperation,
   ApiTags,
@@ -15,6 +16,11 @@ import {
   SendNotificationDto,
   SendNotificationResponseDto,
 } from './dto/send-notification.dto';
+import {
+  DeleteDeviceTokenDto,
+  DeleteDeviceTokenResponseDto,
+  DeleteUserDeviceTokensDto,
+} from './dto/delete-device-token.dto';
 
 @ApiTags('notifications')
 @Controller('notifications')
@@ -59,5 +65,42 @@ export class NotificationsController {
     @Body() dto: SendNotificationDto,
   ): Promise<SendNotificationResponseDto> {
     return this.notificationsService.sendToUser(dto);
+  }
+
+  @Delete('device-token')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Delete a device token',
+    description:
+      'Remove a single FCM device token by its token value. Use this on sign-out or when the client detects the token has been revoked.',
+  })
+  @ApiOkResponse({
+    description: 'Number of records removed (0 if token was not found)',
+    type: DeleteDeviceTokenResponseDto,
+  })
+  @ApiBadRequestResponse({ description: 'token is required' })
+  deleteDeviceToken(
+    @Body() dto: DeleteDeviceTokenDto,
+  ): Promise<DeleteDeviceTokenResponseDto> {
+    return this.notificationsService.deleteDeviceToken(dto);
+  }
+
+  @Delete('device-tokens')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Delete device tokens for a user',
+    description:
+      'Remove all FCM device tokens for a given user and app. Optionally scope the deletion to a single token by including the `token` field. Useful for sign-out-all-devices flows or account deletion.',
+  })
+  @ApiOkResponse({
+    description: 'Number of records removed',
+    type: DeleteDeviceTokenResponseDto,
+  })
+  @ApiNotFoundResponse({ description: 'No tokens found for this user and app' })
+  @ApiBadRequestResponse({ description: 'appId and userId are required' })
+  deleteUserDeviceTokens(
+    @Body() dto: DeleteUserDeviceTokensDto,
+  ): Promise<DeleteDeviceTokenResponseDto> {
+    return this.notificationsService.deleteUserDeviceTokens(dto);
   }
 }
